@@ -1,0 +1,568 @@
+# =====================================================================
+# Battery Fleet Manager
+# Steuert drei Marstek-Venus-Speicher (je 5,12 kWh / 2500 W) ueber die
+# Register 44002 (Max Charge Power) und 44003 (Max Discharge Power).
+#
+# GRUNDPRINZIP (geaendert 04.08.2026): KONZENTRIEREN statt DROSSELN.
+# Wechselrichter haben bei Teillast deutlich schlechtere Wirkungsgrade,
+# weil der Eigenverbrauch konstant bleibt. Frueher bekamen die nicht
+# priorisierten Akkus 500 W - das kostete Wirkungsgrad UND fuehrte zu
+# Einspeisung, weil der einzige ladefaehige Akku gedrosselt war.
+# Jetzt gilt: So wenige Akkus wie noetig, diese dafuer mit voller
+# Leistung. Die Zyklen-Balance wird darueber gesteuert, WELCHER Akku
+# arbeitet - nicht darueber, wie stark er gedrosselt wird.
+#
+# EINSCHRAENKUNG DES PRINZIPS (06.08.2026): NUR NOCH BEIM LADEN.
+# Messvergleich zweier Naechte:
+#   Kaskade mit Entlade-Konzentration : 1,28 kWh Netzbezug in 2 h 50 min
+#   freier Anti-Feed-Betrieb          : 0,14 kWh Netzbezug in  9 min
+# Die Konzentration auf den zyklenaermsten Akku erzeugt nachts einen
+# Einzelpunkt des Versagens: Der geoeffnete Akku laeuft an seine
+# Geraeteuntergrenze, waehrend die anderen voll danebenstehen.
+# Fuer den Zyklenausgleich kostet das Verteilen nichts, denn Zyklen
+# entstehen ueber den LADEDURCHSATZ, nicht ueber das Entladen.
+#
+# UMGANG MIT UNLESBAREN SENSOREN (06.08.2026):
+# "states(...) | float(0)" macht aus einem unavailable-Sensor 0 %. Damit
+# scheiterte die Entladebedingung "soc > Untergrenze", und ein Akku, den
+# Home Assistant nur kurz nicht lesen konnte, wurde vom Entladen
+# ausgesperrt - dieselbe Fehlerform wie in der Problemnacht.
+# Jetzt gilt je Akku ein Gueltigkeitsflag:
+#   LADEN    nur bei gueltigem Ladestand (blind laden waere riskant)
+#   ENTLADEN im Zweifel OFFEN (im Zweifel liefern statt sperren)
+# Das ist die sichere Richtung: Ein faelschlich offener Akku entlaedt im
+# Anti-Feed-Modus nur, wenn tatsaechlich Bedarf besteht.
+#
+# ABLAUF je Zyklus (alle 30 s):
+#   1. Echten Ueberschuss ermitteln:
+#        Ueberschuss = Einspeisung + was die Akkus gerade schon aufnehmen
+#   2. LADEN: Anzahl noetiger Akkus = aufrunden(Ueberschuss / 2500), max. 3
+#      Auswahl unter den faehigen Akkus nach Vorrangregel (siehe unten).
+#   3. ENTLADEN: ALLE Akkus oberhalb ihrer Untergrenze werden geoeffnet.
+#      (2500 ist eine Obergrenze, kein Sollwert - im Anti-Feed-Modus
+#      regelt der Akku selbst auf den tatsaechlichen Bedarf.)
+#
+# SICHERHEITSEBENEN:
+#   - Netzbezug > 150 W -> sofort ALLE Akkus oberhalb der Notreserve auf
+#     volle Entladeleistung (eigener 5-s-Schnelltrigger).
+#   - Notreserve (Standard 12 %) ist absolute Untergrenze, auch bei
+#     Netzbezug.
+#   - Nachtreserve: ab 17 Uhr wird geprueft, ob die gespeicherte Energie
+#     fuer die Nacht reicht. Falls nicht, faellt der Ladedeckel.
+#     Schwelle aus 25 gemessenen Naechten: Median 7,2 / 90% 9,1 /
+#     Maximum 11,2 kWh. Bei 80 % SoC stehen 10,4 kWh bereit.
+# =====================================================================
+
+input_boolean:
+  battery_fleet_manager:
+    name: "Battery Fleet Manager"
+    icon: mdi:battery-heart-variant
+
+input_number:
+  # --- Akkuindividuelle Baender (04.08.2026) -------------------------
+  # Zyklen entstehen durch Ladedurchsatz. Wer aufholen soll, braucht ein
+  # BREITES Band (tief entladen + voll laden), wer geschont wird, ein
+  # schmales. Zyklenstand 04.08.: M1=264, M2=138, M3=125.
+  # Marstek3 faehrt bewusst bis 100 %: LiFePO4-BMS balancieren die Zellen
+  # nur im oberen Ladebereich - er verharrt dort aber nicht, weil er
+  # abends als erster wieder abgearbeitet wird.
+  fleet_m1_soc_max:
+    name: "Marstek1 Ladedeckel"
+    min: 40
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-70
+  fleet_m1_soc_min:
+    name: "Marstek1 Entlade-Untergrenze"
+    min: 12
+    max: 60
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-30
+  fleet_m2_soc_max:
+    name: "Marstek2 Ladedeckel"
+    min: 40
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-90
+  fleet_m2_soc_min:
+    name: "Marstek2 Entlade-Untergrenze"
+    min: 12
+    max: 60
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-20
+  fleet_m3_soc_max:
+    name: "Marstek3 Ladedeckel"
+    min: 40
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery
+  fleet_m3_soc_min:
+    name: "Marstek3 Entlade-Untergrenze"
+    min: 12
+    max: 60
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-10
+  # --- Nachlade-Vorrang (06.08.2026) ----------------------------------
+  # Ein Akku, der die Nacht getragen hat, steht morgens deutlich tiefer als
+  # die anderen. Er soll zuerst wieder gefuellt werden, damit er fuer die
+  # naechste Nacht bereitsteht - unabhaengig vom Zyklenstand. Nur wenn kein
+  # Akku unter dieser Schwelle liegt, entscheidet wieder der Zyklenausgleich.
+  # 0 = Funktion aus.
+  fleet_nachlade_grenze:
+    name: "Fleet Nachlade-Vorrang unter"
+    min: 0
+    max: 80
+    step: 5
+    unit_of_measurement: "%"
+    icon: mdi:battery-charging-low
+  # --- Spaete Volladung -----------------------------------------------
+  # Bis "voll_ab_stunde" wird nur bis zum Tagesdeckel geladen. Erst danach
+  # sind die vollen akkuindividuellen Deckel frei. So verbringen die Akkus
+  # moeglichst wenig Zeit im hohen Ladebereich.
+  # Sicherung: reicht die PV-Restprognose nicht mehr aus, um bis Sonnen-
+  # untergang voll zu werden, wird sofort freigegeben (kein Energieverlust
+  # an bewoelkten Tagen).
+  fleet_voll_ab_stunde:
+    name: "Fleet Volladung ab Stunde"
+    min: 10
+    max: 20
+    step: 1
+    unit_of_measurement: "Uhr"
+    icon: mdi:clock-outline
+  fleet_tagesdeckel:
+    name: "Fleet Tagesdeckel (vor Volladung)"
+    min: 50
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:weather-sunny
+  fleet_soc_notreserve:
+    name: "Fleet Absolute Notreserve"
+    min: 5
+    max: 30
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-alert
+  fleet_nachtverbrauch_kwh:
+    name: "Fleet Geschaetzter Nachtverbrauch"
+    min: 1
+    max: 20
+    step: 0.5
+    unit_of_measurement: "kWh"
+    icon: mdi:weather-night
+  # Wird seit dem Umbau auf "Konzentrieren statt Drosseln" nicht mehr
+  # verwendet. Helfer bleibt bestehen, damit das Dashboard nicht bricht.
+  fleet_sekundaer_leistung:
+    name: "Fleet Gedrosselte Leistung (nicht mehr verwendet)"
+    min: 0
+    max: 2500
+    step: 50
+    unit_of_measurement: "W"
+    icon: mdi:speedometer-slow
+  # Wirkte nur auf die Entlade-Konzentration. Seit dem 06.08.2026 werden
+  # beim Entladen ohnehin alle faehigen Akkus geoeffnet - der Faktor hat
+  # keine Wirkung mehr. Helfer bleibt fuer das Dashboard bestehen.
+  fleet_lastspitze_faktor:
+    name: "Fleet Lastspitzen-Sicherheitsfaktor (nicht mehr verwendet)"
+    min: 1.0
+    max: 3.0
+    step: 0.1
+    unit_of_measurement: "x"
+    icon: mdi:chart-line
+
+template:
+  - sensor:
+      - name: "Batterie SoC Summe"
+        unique_id: battery_soc_summe
+        unit_of_measurement: "%"
+        state: >
+          {% set a = states('sensor.my_battery_battery_soc') | float(0) %}
+          {% set b = states('sensor.marstek2_battery_soc') | float(0) %}
+          {% set c = states('sensor.marstek3_battery_soc') | float(0) %}
+          {{ ((a + b + c) / 3) | round(1) }}
+
+      - name: "Balancing Target"
+        unique_id: balancing_target
+        state: >
+          {% set batteries = [
+            {'prefix': 'my_battery', 'cycles': states('sensor.my_battery_charge_cycles')|float(0)},
+            {'prefix': 'marstek2', 'cycles': states('sensor.marstek2_charge_cycles')|float(0)},
+            {'prefix': 'marstek3', 'cycles': states('sensor.marstek3_charge_cycles')|float(0)}
+          ] %}
+          {{ (batteries | sort(attribute='cycles', reverse=true))[0].prefix }}
+        attributes:
+          hub: >
+            {% set m = {'my_battery':'MarstekVenus','marstek2':'Marstek2','marstek3':'Marstek3'} %}
+            {{ m.get(states('sensor.balancing_target'), 'MarstekVenus') }}
+          title: >
+            {% set m = {'my_battery':'Marstek1','marstek2':'Marstek2','marstek3':'Marstek3'} %}
+            {{ m.get(states('sensor.balancing_target'), 'Marstek1') }}
+          soc: >
+            {% set m = {'my_battery':'sensor.my_battery_battery_soc','marstek2':'sensor.marstek2_battery_soc','marstek3':'sensor.marstek3_battery_soc'} %}
+            {{ states(m.get(states('sensor.balancing_target'), 'sensor.my_battery_battery_soc'))|float(0) }}
+
+      - name: "Batterie Zyklen-Spanne"
+        unique_id: battery_zyklen_spanne
+        unit_of_measurement: "%"
+        state: >
+          {% set c1 = states('sensor.my_battery_charge_cycles')|float(0) %}
+          {% set c2 = states('sensor.marstek2_charge_cycles')|float(0) %}
+          {% set c3 = states('sensor.marstek3_charge_cycles')|float(0) %}
+          {% set avg = (c1 + c2 + c3) / 3 %}
+          {{ (( [c1,c2,c3]|max - [c1,c2,c3]|min ) / avg * 100) | round(0) if avg > 0 else 0 }}
+        attributes:
+          meiste_zyklen: >
+            {% set b = [
+              {'t':'Marstek1','v': states('sensor.my_battery_charge_cycles')|float(0)},
+              {'t':'Marstek2','v': states('sensor.marstek2_charge_cycles')|float(0)},
+              {'t':'Marstek3','v': states('sensor.marstek3_charge_cycles')|float(0)}
+            ] | sort(attribute='v', reverse=true) %}
+            {{ b[0].t }} ({{ b[0].v | round(0) }})
+          wenigste_zyklen: >
+            {% set b = [
+              {'t':'Marstek1','v': states('sensor.my_battery_charge_cycles')|float(0)},
+              {'t':'Marstek2','v': states('sensor.marstek2_charge_cycles')|float(0)},
+              {'t':'Marstek3','v': states('sensor.marstek3_charge_cycles')|float(0)}
+            ] | sort(attribute='v', reverse=true) %}
+            {{ b[-1].t }} ({{ b[-1].v | round(0) }})
+          marstek1_abweichung: >
+            {% set c1 = states('sensor.my_battery_charge_cycles')|float(0) %}
+            {% set c2 = states('sensor.marstek2_charge_cycles')|float(0) %}
+            {% set c3 = states('sensor.marstek3_charge_cycles')|float(0) %}
+            {% set avg = (c1 + c2 + c3) / 3 %}
+            {{ '%+.0f' % ((c1 - avg) / avg * 100) if avg > 0 else '0' }}%
+          marstek2_abweichung: >
+            {% set c1 = states('sensor.my_battery_charge_cycles')|float(0) %}
+            {% set c2 = states('sensor.marstek2_charge_cycles')|float(0) %}
+            {% set c3 = states('sensor.marstek3_charge_cycles')|float(0) %}
+            {% set avg = (c1 + c2 + c3) / 3 %}
+            {{ '%+.0f' % ((c2 - avg) / avg * 100) if avg > 0 else '0' }}%
+          marstek3_abweichung: >
+            {% set c1 = states('sensor.my_battery_charge_cycles')|float(0) %}
+            {% set c2 = states('sensor.marstek2_charge_cycles')|float(0) %}
+            {% set c3 = states('sensor.marstek3_charge_cycles')|float(0) %}
+            {% set avg = (c1 + c2 + c3) / 3 %}
+            {{ '%+.0f' % ((c3 - avg) / avg * 100) if avg > 0 else '0' }}%
+
+      - name: "Batterie SoC-Spanne"
+        unique_id: battery_soc_spanne
+        unit_of_measurement: "%"
+        state: >
+          {% set a = states('sensor.my_battery_battery_soc') | float(0) %}
+          {% set b = states('sensor.marstek2_battery_soc') | float(0) %}
+          {% set c = states('sensor.marstek3_battery_soc') | float(0) %}
+          {% set avg = (a + b + c) / 3 %}
+          {{ (( [a,b,c]|max - [a,b,c]|min ) / avg * 100) | round(0) if avg > 0 else 0 }}
+
+      - name: "Fleet Nachtreserve Defizit"
+        unique_id: fleet_nachtreserve_defizit
+        unit_of_measurement: "kWh"
+        state: >
+          {% set need = states('input_number.fleet_nachtverbrauch_kwh')|float(10) %}
+          {% set have = states('sensor.batterysumme_verbleibendekwh')|float(0) %}
+          {{ ([need - have, 0] | max) | round(2) }}
+
+      # Diagnose: zeigt im Dashboard, was die Kaskade gerade entscheidet
+      - name: "Fleet Status"
+        unique_id: fleet_status
+        state: >
+          {% set g = states('sensor.leistung_stromzaehler')|float(0) %}
+          {% if g > 50 %}Netzbezug
+          {% elif g < -50 %}Einspeisung
+          {% else %}ausgeglichen{% endif %}
+        attributes:
+          ueberschuss_w: >
+            {% set g = states('sensor.leistung_stromzaehler')|float(0) %}
+            {% set a = states('sensor.my_battery_ac_power')|float(0) %}
+            {% set b = states('sensor.marstek2_ac_power')|float(0) %}
+            {% set c = states('sensor.marstek3_ac_power')|float(0) %}
+            {% set laden = [0,-a]|max + [0,-b]|max + [0,-c]|max %}
+            {{ ([0, -g]|max + laden) | round(0) }}
+          bedarf_w: >
+            {% set g = states('sensor.leistung_stromzaehler')|float(0) %}
+            {% set a = states('sensor.my_battery_ac_power')|float(0) %}
+            {% set b = states('sensor.marstek2_ac_power')|float(0) %}
+            {% set c = states('sensor.marstek3_ac_power')|float(0) %}
+            {% set entladen = [0,a]|max + [0,b]|max + [0,c]|max %}
+            {{ ([0, g]|max + entladen) | round(0) }}
+          # Zeigt an, welche Akkus die Kaskade gerade ueberhaupt lesen kann
+          soc_lesbar: >
+            {{ [ 'M1' if states('sensor.my_battery_battery_soc') | is_number else None,
+                 'M2' if states('sensor.marstek2_battery_soc') | is_number else None,
+                 'M3' if states('sensor.marstek3_battery_soc') | is_number else None ]
+               | reject('none') | join(' ') }}
+
+automation:
+  - id: fleet_manager_apply
+    alias: "Fleet Manager: Kaskade anwenden"
+    description: >-
+      LADEN: oeffnet genau so viele Akkus wie noetig, diese dafuer mit voller
+      Leistung (effizienter Betriebspunkt), Auswahl nach Vorrangregel.
+      ENTLADEN: oeffnet alle Akkus oberhalb ihrer Untergrenze; bei unlesbarem
+      Ladestand bleibt der Akku offen.
+      Sicherheitsebenen: Netzbezug, Notreserve, Nachtreserve.
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        seconds: "/30"
+      - trigger: state
+        entity_id: input_boolean.battery_fleet_manager
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.battery_fleet_manager
+        state: "on"
+    actions:
+      - variables:
+          # Gueltigkeit ZUERST pruefen - "| float(0)" wuerde aus einem
+          # unavailable-Sensor sonst unbemerkt 0 % machen.
+          g1: "{{ states('sensor.my_battery_battery_soc') | is_number }}"
+          g2: "{{ states('sensor.marstek2_battery_soc') | is_number }}"
+          g3: "{{ states('sensor.marstek3_battery_soc') | is_number }}"
+          soc1: "{{ states('sensor.my_battery_battery_soc') | float(0) }}"
+          soc2: "{{ states('sensor.marstek2_battery_soc') | float(0) }}"
+          soc3: "{{ states('sensor.marstek3_battery_soc') | float(0) }}"
+          cyc1: "{{ states('sensor.my_battery_charge_cycles') | float(999) }}"
+          cyc2: "{{ states('sensor.marstek2_charge_cycles') | float(999) }}"
+          cyc3: "{{ states('sensor.marstek3_charge_cycles') | float(999) }}"
+          cap1: "{{ states('input_number.fleet_m1_soc_max') | float(65) }}"
+          cap2: "{{ states('input_number.fleet_m2_soc_max') | float(90) }}"
+          cap3: "{{ states('input_number.fleet_m3_soc_max') | float(100) }}"
+          flr1: "{{ states('input_number.fleet_m1_soc_min') | float(35) }}"
+          flr2: "{{ states('input_number.fleet_m2_soc_min') | float(25) }}"
+          flr3: "{{ states('input_number.fleet_m3_soc_min') | float(25) }}"
+          notreserve: "{{ states('input_number.fleet_soc_notreserve') | float(12) }}"
+          nachlade: "{{ states('input_number.fleet_nachlade_grenze') | float(50) }}"
+          # Netzzaehler: positiv = Bezug, negativ = Einspeisung
+          grid_w: "{{ states('sensor.leistung_stromzaehler') | float(0) }}"
+          # AC-Leistung je Akku: negativ = laedt, positiv = entlaedt
+          ac1: "{{ states('sensor.my_battery_ac_power') | float(0) }}"
+          ac2: "{{ states('sensor.marstek2_ac_power') | float(0) }}"
+          ac3: "{{ states('sensor.marstek3_ac_power') | float(0) }}"
+          lade_jetzt: "{{ [0,-ac1]|max + [0,-ac2]|max + [0,-ac3]|max }}"
+          # Echter Ueberschuss inkl. dessen, was die Akkus schon aufnehmen
+          ueberschuss: "{{ [0, -grid_w]|max + lade_jetzt }}"
+          # Schwelle 100 W statt 50 W (10.08.2026): Dieser Schalter steuert
+          # nur noch EINES - ob die akkuindividuellen Untergrenzen zugunsten
+          # der Notreserve (12 %) aufgegeben werden. Das Entladen oeffnet
+          # ohnehin immer alle faehigen Akkus. Bei 50 W sprach er auf das
+          # Rauschen des Netzzaehlers an: die Akkus liefen nachts bis auf
+          # 11..15 % leer und hatten im Morgengrauen nichts mehr - der
+          # Netzbezug wurde dadurch groesser statt kleiner (gemessen 10.08.).
+          netzbezug: "{{ grid_w > 100 }}"
+          # Nachtreserve (Ebene 2): erst ab 17 Uhr, damit die Akkus bis dahin
+          # regulaer bis zum Deckel laden koennen ohne Scheindefizit
+          defizit: "{{ states('sensor.fleet_nachtreserve_defizit') | float(0) }}"
+          ceiling_override: "{{ now().hour >= 17 and defizit > 0 }}"
+          # --- Spaete Volladung ---
+          voll_ab: "{{ states('input_number.fleet_voll_ab_stunde') | float(15) }}"
+          tagesdeckel: "{{ states('input_number.fleet_tagesdeckel') | float(80) }}"
+          pv_rest: "{{ states('sensor.pv_rest_heute_noch') | float(0) }}"
+          # Was fehlt den Akkus noch bis zu ihren vollen Deckeln (kWh)?
+          fehlt_kwh: >-
+            {{ ((([0, cap1 - soc1]|max) + ([0, cap2 - soc2]|max)
+               + ([0, cap3 - soc3]|max)) * 5.12 / 100) | round(2) }}
+          # Reicht die Restsonne knapp? Dann sofort voll freigeben.
+          pv_knapp: "{{ pv_rest <= (fehlt_kwh * 1.3) }}"
+          voll_erlaubt: "{{ now().hour >= voll_ab or pv_knapp or ceiling_override }}"
+          # Effektiver Ladedeckel je Akku
+          ecap1: "{{ cap1 if voll_erlaubt else [cap1, tagesdeckel]|min }}"
+          ecap2: "{{ cap2 if voll_erlaubt else [cap2, tagesdeckel]|min }}"
+          ecap3: "{{ cap3 if voll_erlaubt else [cap3, tagesdeckel]|min }}"
+          # Anzahl benoetigter Ladeakkus (2500 W je Geraet), max. 3
+          n_lade: "{{ [3, ((ueberschuss / 2500) | round(0, 'ceil') | int)] | min }}"
+          # LADEN: faehig = Ladestand LESBAR und unter dem Deckel.
+          # Sortierschluessel aufsteigend, drei Vorrangstufen - innerhalb jeder
+          # Stufe zuerst der leerste Akku:
+          #   soc-2000  unter der Entlade-Untergrenze (dringend zurueck ins Band)
+          #   soc-1000  unter der Nachladegrenze      (hat die Nacht getragen)
+          #   cyc       sonst: Zyklenstand aufsteigend (Zyklenausgleich)
+          # Die Zyklenstaende liegen bei 125..265, damit sortieren beide
+          # Sonderstufen zuverlaessig davor.
+          lade_hubs: >-
+            {% set b = [
+              {'h':'MarstekVenus','ok': g1 and soc1 < (100 if ceiling_override else ecap1),
+               'k': (soc1 - 2000 if soc1 < flr1
+                     else (soc1 - 1000 if soc1 < nachlade else cyc1))},
+              {'h':'Marstek2','ok': g2 and soc2 < (100 if ceiling_override else ecap2),
+               'k': (soc2 - 2000 if soc2 < flr2
+                     else (soc2 - 1000 if soc2 < nachlade else cyc2))},
+              {'h':'Marstek3','ok': g3 and soc3 < (100 if ceiling_override else ecap3),
+               'k': (soc3 - 2000 if soc3 < flr3
+                     else (soc3 - 1000 if soc3 < nachlade else cyc3))}] %}
+            {{ (b | selectattr('ok') | sort(attribute='k'))[:n_lade]
+               | map(attribute='h') | list }}
+          # ENTLADEN: ALLE faehigen Akkus oeffnen (geaendert 06.08.2026).
+          # Frueher wurde auf den zyklenaermsten Akku konzentriert und bei
+          # Annaeherung an die Untergrenze der naechste dazugenommen ("sanfte
+          # Uebergabe"). Das hat den Netzbezug nur abgemildert, nicht behoben:
+          # In der Nacht 04./05.08. lief Marstek3 an seinen Geraeteboden,
+          # waehrend Marstek2 mit 81 % gesperrt danebenstand - 1,28 kWh Bezug.
+          # Der freie Anti-Feed-Betrieb in der Nacht 05./06.08. kam mit
+          # denselben Akkus auf 0,14 kWh.
+          # Verteilen kostet keinen Zyklenausgleich (Zyklen = Ladedurchsatz)
+          # und keine Leistung (2500 ist Obergrenze, nicht Sollwert).
+          # Bei UNLESBAREM Ladestand bleibt der Akku offen - im Zweifel
+          # liefern statt sperren.
+          entlade_hubs: >-
+            {% set b = [
+              {'h':'MarstekVenus',
+               'ok': (not g1) or soc1 > (notreserve if netzbezug else flr1)},
+              {'h':'Marstek2',
+               'ok': (not g2) or soc2 > (notreserve if netzbezug else flr2)},
+              {'h':'Marstek3',
+               'ok': (not g3) or soc3 > (notreserve if netzbezug else flr3)}] %}
+            {{ b | selectattr('ok') | map(attribute='h') | list }}
+      - repeat:
+          for_each:
+            - MarstekVenus
+            - Marstek2
+            - Marstek3
+          sequence:
+            - action: modbus.write_register
+              data:
+                hub: "{{ repeat.item }}"
+                address: 44002
+                slave: 1
+                value: "{{ 2500 if repeat.item in lade_hubs else 0 }}"
+            - action: modbus.write_register
+              data:
+                hub: "{{ repeat.item }}"
+                address: 44003
+                slave: 1
+                value: "{{ 2500 if repeat.item in entlade_hubs else 0 }}"
+
+  - id: fleet_manager_disable
+    alias: "Fleet Manager: Ausschalten"
+    description: >-
+      Setzt alle drei Batterien zurueck auf 2500/2500 (keine Sperre), sobald
+      der Fleet Manager ausgeschaltet wird.
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_boolean.battery_fleet_manager
+        to: "off"
+    conditions: []
+    actions:
+      - repeat:
+          for_each:
+            - MarstekVenus
+            - Marstek2
+            - Marstek3
+          sequence:
+            - action: modbus.write_register
+              data:
+                hub: "{{ repeat.item }}"
+                address: 44002
+                slave: 1
+                value: 2500
+            - action: modbus.write_register
+              data:
+                hub: "{{ repeat.item }}"
+                address: 44003
+                slave: 1
+                value: 2500
+
+  - id: fleet_manager_netzbezug_schutz
+    alias: "Fleet Manager: Netzbezug-Schutz (schnell)"
+    description: >-
+      Schneller 5-s-Trigger zusaetzlich zum 30-s-Hauptzyklus: bei echtem
+      Netzbezug sofort alle Batterien oberhalb der Notreserve auf volle
+      Entladeleistung. Bei unlesbarem Ladestand wird geoeffnet.
+    mode: single
+    triggers:
+      # 150 W statt 50 W: Der Netzzaehler pendelt im Normalbetrieb um die Null,
+      # weil die Speicher im Anti-Feed-Modus dagegenregeln. Bei 50 W loeste der
+      # Trigger ~53x pro Halbtag aus - jedes Mal wurde die sorgfaeltige Auswahl
+      # der Kaskade fuer bis zu 30 s durch "alle oeffnen" ueberschrieben.
+      - trigger: numeric_state
+        entity_id: sensor.leistung_stromzaehler
+        above: 150
+        for:
+          seconds: 5
+    conditions:
+      - condition: state
+        entity_id: input_boolean.battery_fleet_manager
+        state: "on"
+    actions:
+      - variables:
+          notreserve: "{{ states('input_number.fleet_soc_notreserve') | float(12) }}"
+      - action: modbus.write_register
+        data:
+          hub: MarstekVenus
+          address: 44003
+          slave: 1
+          value: >-
+            {% set s = states('sensor.my_battery_battery_soc') %}
+            {{ 0 if (s | is_number and s | float(0) <= notreserve) else 2500 }}
+      - action: modbus.write_register
+        data:
+          hub: Marstek2
+          address: 44003
+          slave: 1
+          value: >-
+            {% set s = states('sensor.marstek2_battery_soc') %}
+            {{ 0 if (s | is_number and s | float(0) <= notreserve) else 2500 }}
+      - action: modbus.write_register
+        data:
+          hub: Marstek3
+          address: 44003
+          slave: 1
+          value: >-
+            {% set s = states('sensor.marstek3_battery_soc') %}
+            {{ 0 if (s | is_number and s | float(0) <= notreserve) else 2500 }}
+
+  - id: fleet_manager_netzbezug_meldung
+    alias: "Fleet Manager: Netzbezug-Meldung (nur bei anhaltendem Bezug)"
+    description: >-
+      Meldet NICHT jeden kurzen Netzbezug - das waeren dutzende Meldungen pro
+      Abend, denn der Schutztrigger reagiert bewusst schon ab 150 W. Gemeldet
+      wird nur, wenn der Bezug trotz geoeffneter Speicher anhaelt.
+      Feste notification_id: Folgemeldungen ersetzen die vorige.
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.leistung_stromzaehler
+        above: 300
+        for:
+          minutes: 3
+    conditions:
+      - condition: state
+        entity_id: input_boolean.battery_fleet_manager
+        state: "on"
+    actions:
+      - action: notify.persistent_notification
+        data:
+          notification_id: fleet_netzbezug
+          title: "Netzbezug haelt an"
+          message: >-
+            Seit 3 Minuten mehr als 300 W Netzbezug (aktuell
+            {{ states('sensor.leistung_stromzaehler') }} W), obwohl die
+            Speicher freigegeben sind.
+            Ladestand: M1 {{ states('sensor.my_battery_battery_soc') }}%,
+            M2 {{ states('sensor.marstek2_battery_soc') }}%,
+            M3 {{ states('sensor.marstek3_battery_soc') }}%.
+            Moegliche Ursachen: Speicher an der Notreserve, Last ueber 7,5 kW,
+            oder eine Modbus-Stoerung.
+
+  - id: fleet_manager_netzbezug_entwarnung
+    alias: "Fleet Manager: Netzbezug-Entwarnung"
+    description: "Raeumt die Netzbezug-Meldung wieder weg, sobald es vorbei ist."
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.leistung_stromzaehler
+        below: 50
+        for:
+          minutes: 5
+    conditions: []
+    actions:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: fleet_netzbezug

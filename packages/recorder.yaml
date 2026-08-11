@@ -1,0 +1,81 @@
+# =====================================================================
+# Recorder-Konfiguration
+# Ziel: Datenbank klein halten, damit sie in den Page-Cache passt.
+# Ausgangslage 04.08.2026: 7,04 GB / ~25 Mio states-Zeilen aus 10 Tagen.
+#
+# PRINZIP:
+#   - Momentanwerte (W, kW, V, dBm, s) werden NICHT aufgezeichnet.
+#     Sie funktionieren live unveraendert weiter - der Fleet Manager und
+#     alle Automationen lesen die Live-States, nicht die Datenbank.
+#   - Akkumulierende Zaehler (Wh/kWh, total_increasing) bleiben drin,
+#     damit Energy-Dashboard und Langzeitstatistik intakt bleiben.
+#
+# HINWEIS: Langzeitstatistik (statistics) wird von purge_keep_days NICHT
+# geloescht - der 5-Jahres-Verlauf seit 2021 bleibt vollstaendig erhalten.
+# =====================================================================
+
+recorder:
+  # SCHRITTWEISER ABBAU (Stand 04.08.2026):
+  # Die Datenbank enthielt 8 Tage / ~25 Mio Zeilen (7 GB). Ein Purge auf
+  # 3 Tage haette ~18 Mio Zeilen auf einmal loeschen muessen - das hat das
+  # System zweimal blockiert (Hochrechnung: >40 Stunden Laufzeit).
+  # Deshalb: Wert entspricht zunaechst dem vorhandenen Bestand, damit der
+  # naechtliche Purge um 4:12 Uhr jeweils nur EINEN Tag entfernt.
+  # Da neue Tage dank der Ausschluesse unten nur noch einen Bruchteil gross
+  # sind, schrumpft die Datenbank dabei von selbst.
+  # Plan: alle paar Tage um 1 senken, bis 3 erreicht ist.
+  purge_keep_days: 8
+  commit_interval: 10
+
+  exclude:
+    domains:
+      # ~209 Update-Entitaeten - Versionsstaende brauchen keine Historie
+      - update
+
+    entity_globs:
+      # Netzfrequenzen (die Entitaeten werden zusaetzlich deaktiviert)
+      - sensor.*_frequency
+      - sensor.*_fhz
+      # Phasenspannungen
+      - sensor.*_voltage_l*
+      # Scheinleistung
+      - sensor.*_apparent_power
+      # Diagnose-Werte
+      - sensor.*_wifi_signal_strength
+      - sensor.*_uptime
+      - sensor.*_last_restart
+      # Shelly 3EM Momentanleistung (Waermepumpe + Kochfeld)
+      - sensor.shelly_pro_3em_*_active_power
+      # go-eCharger Spannungsarray
+      - sensor.go_echarger_072750_nrg*
+
+    entities:
+      # --- Momentanleistung: BEWUSST NICHT ausgeschlossen ---
+      # sensor.leistung_stromzaehler und sensor.total_active_power bleiben
+      # aufgezeichnet. Sie sind die zentralen Messwerte der Anlage: ohne ihre
+      # Historie lassen sich Netzbezug-Ereignisse im Nachhinein nicht mehr
+      # untersuchen, und genau das ist der Zweck der Wirksamkeitspruefung.
+      # Kosten: rund 86.000 Zeilen pro Tag und Sensor - bei 8 Tagen Aufbewahrung
+      # ein kleiner Anteil der frueheren 2,5 Mio Zeilen taeglich.
+      #
+      # --- Redundante bzw. abgeleitete Leistungswerte (bleiben draussen) ---
+      - sensor.leistung_stromzaehlerkw     # identisch mit leistung_stromzaehler, nur in kW
+      - sensor.tasmota3_sml_power          # zweite Messung derselben Groesse
+      - sensor.b2500sensor
+      - sensor.export_power                # aus einspeise_leistung abgeleitet
+      - sensor.export_power_raw
+      - sensor.filtered_sensor_strom       # geglaettete Variante
+      - sensor.wr_power
+      - sensor.wr_powerdc
+      # --- Heizstrahler-Steckdose ---
+      - sensor.shellyplugheizstrahler_relay_0_power
+      - sensor.shellyplugheizstrahler_relay_0_temperature
+      # --- Abgeleitete Mittelwerte / Raten ---
+      - sensor.expgldurchschnitt_ema_asymalpha
+      - sensor.dynamischer_ladepreis_mittelwert
+      - sensor.go_echarger_kosten_rate
+      # --- SSH-command_line-Sensoren (aendern sich alle 3-5 s) ---
+      - sensor.protect_last_plate
+      - sensor.protect_last_verified_face
+      - sensor.g6_local_face_raw
+      - sensor.g6_local_plate_raw

@@ -1,0 +1,134 @@
+# =====================================================================
+# Fleet Monitoring (Nachschau-Datensammlung)
+# Erfasst ab Aktivierung die Kennzahlen, an denen der Battery Fleet
+# Manager gemessen werden soll:
+#   1. Netzbezug vermeiden:  Dauer (min/Tag) und Energie (kWh/Tag) mit
+#      Netzbezug
+#   2. Akkus schonen:        Zeit je Akku pro Tag im Niedrigband
+#      (<= Fleet Mindest-Ladestand) und im Hochband (>= Fleet Maximaler
+#      Ladestand)
+#   3. Balancing:            Ladeenergie je Akku pro Tag (daraus ergibt
+#      sich der taegliche Zyklenzuwachs; Marstek1 hat bereits
+#      sensor.my_battery_daily_charging_in_kwh)
+# Die Banddefinitionen folgen den einstellbaren Fleet-Schwellen, damit
+# die Nachschau immer zur aktuellen Konfiguration passt.
+# =====================================================================
+
+template:
+  - binary_sensor:
+      - name: "Fleet Netzbezug aktiv"
+        unique_id: fleet_netzbezug_aktiv
+        state: "{{ states('sensor.leistung_stromzaehler')|float(0) > 50 }}"
+
+      - name: "Marstek1 SoC Niedrigband"
+        unique_id: marstek1_soc_niedrigband
+        state: >-
+          {{ states('sensor.my_battery_battery_soc')|float(100)
+             <= states('input_number.fleet_m1_soc_min')|float(25) }}
+      - name: "Marstek1 SoC Hochband"
+        unique_id: marstek1_soc_hochband
+        state: >-
+          {{ states('sensor.my_battery_battery_soc')|float(0)
+             >= states('input_number.fleet_m1_soc_max')|float(80) }}
+
+      - name: "Marstek2 SoC Niedrigband"
+        unique_id: marstek2_soc_niedrigband
+        state: >-
+          {{ states('sensor.marstek2_battery_soc')|float(100)
+             <= states('input_number.fleet_m2_soc_min')|float(25) }}
+      - name: "Marstek2 SoC Hochband"
+        unique_id: marstek2_soc_hochband
+        state: >-
+          {{ states('sensor.marstek2_battery_soc')|float(0)
+             >= states('input_number.fleet_m2_soc_max')|float(80) }}
+
+      - name: "Marstek3 SoC Niedrigband"
+        unique_id: marstek3_soc_niedrigband
+        state: >-
+          {{ states('sensor.marstek3_battery_soc')|float(100)
+             <= states('input_number.fleet_m3_soc_min')|float(25) }}
+      - name: "Marstek3 SoC Hochband"
+        unique_id: marstek3_soc_hochband
+        state: >-
+          {{ states('sensor.marstek3_battery_soc')|float(0)
+             >= states('input_number.fleet_m3_soc_max')|float(80) }}
+
+sensor:
+  - platform: history_stats
+    name: "Fleet Netzbezug Dauer heute"
+    unique_id: fleet_netzbezug_dauer_heute
+    entity_id: binary_sensor.fleet_netzbezug_aktiv
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0) }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Marstek1 Zeit Niedrigband heute"
+    unique_id: marstek1_zeit_niedrigband_heute
+    entity_id: binary_sensor.marstek1_soc_niedrigband
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0) }}"
+    end: "{{ now() }}"
+  - platform: history_stats
+    name: "Marstek1 Zeit Hochband heute"
+    unique_id: marstek1_zeit_hochband_heute
+    entity_id: binary_sensor.marstek1_soc_hochband
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0) }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Marstek2 Zeit Niedrigband heute"
+    unique_id: marstek2_zeit_niedrigband_heute
+    entity_id: binary_sensor.marstek2_soc_niedrigband
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0) }}"
+    end: "{{ now() }}"
+  - platform: history_stats
+    name: "Marstek2 Zeit Hochband heute"
+    unique_id: marstek2_zeit_hochband_heute
+    entity_id: binary_sensor.marstek2_soc_hochband
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0) }}"
+    end: "{{ now() }}"
+
+  - platform: history_stats
+    name: "Marstek3 Zeit Niedrigband heute"
+    unique_id: marstek3_zeit_niedrigband_heute
+    entity_id: binary_sensor.marstek3_soc_niedrigband
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0) }}"
+    end: "{{ now() }}"
+  - platform: history_stats
+    name: "Marstek3 Zeit Hochband heute"
+    unique_id: marstek3_zeit_hochband_heute
+    entity_id: binary_sensor.marstek3_soc_hochband
+    state: "on"
+    type: time
+    start: "{{ now().replace(hour=0, minute=0, second=0) }}"
+    end: "{{ now() }}"
+
+utility_meter:
+  fleet_netzbezug_energie_taeglich:
+    name: "Fleet Netzbezug Energie taeglich"
+    unique_id: fleet_netzbezug_energie_taeglich
+    source: sensor.stromverbrauch_zaehler
+    cycle: daily
+
+  marstek2_ladeenergie_taeglich:
+    name: "Marstek2 Ladeenergie taeglich"
+    unique_id: marstek2_ladeenergie_taeglich
+    source: sensor.marstek2_total_charging_energy_calculated
+    cycle: daily
+
+  marstek3_ladeenergie_taeglich:
+    name: "Marstek3 Ladeenergie taeglich"
+    unique_id: marstek3_ladeenergie_taeglich
+    source: sensor.marstek3_total_charging_energy_calculated
+    cycle: daily

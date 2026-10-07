@@ -58,6 +58,54 @@ input_boolean:
     name: "Battery Fleet Manager"
     icon: mdi:battery-heart-variant
 
+# =====================================================================
+# Freilauf-Button (12.08.2026)
+# Ein-Klick-Notausstieg: Automatik aus, alle Grenzen auf Geraete-Maximum
+# (2500/2500 = keine Sperre), Speicher bleiben im eigenen Anti-Feed-Modus
+# und regeln selbst gegen den Netzzaehler ("Netzbezug vermeiden" pur, ohne
+# Zellschonung/Zyklenausgleich der Kaskade).
+#
+# Das Ausschalten von input_boolean.battery_fleet_manager loest bereits
+# ueber "Fleet Manager: Ausschalten" (unten) dieselben Schreibvorgaenge aus.
+# Dieses Script schreibt sie zusaetzlich EXPLIZIT, damit ein zweiter Klick
+# auch dann sicher wirkt, wenn der Schalter schon aus war (dann faende
+# naemlich kein "to: off"-Uebergang mehr statt, der die Automation ausloest).
+# =====================================================================
+script:
+  fleet_manager_freilauf:
+    alias: "Fleet Manager: Freilauf (Automatik aus, Akkus frei)"
+    icon: mdi:battery-unknown
+    description: >-
+      Schaltet die Kaskade ab und hebt alle Lade-/Entladegrenzen auf das
+      Geraete-Maximum (2500/2500) - die Speicher regeln danach voellig
+      eigenstaendig im Anti-Feed-Modus gegen den Netzzaehler.
+    mode: single
+    sequence:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.battery_fleet_manager
+      - repeat:
+          for_each:
+            - MarstekVenus
+            - Marstek2
+            - Marstek3
+          sequence:
+            - action: modbus.write_register
+              data:
+                hub: "{{ repeat.item }}"
+                address: 44002
+                slave: 1
+                value: 2500
+            - action: modbus.write_register
+              data:
+                hub: "{{ repeat.item }}"
+                address: 44003
+                slave: 1
+                value: 2500
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: fleet_netzbezug
+
 input_number:
   # --- Akkuindividuelle Baender (04.08.2026) -------------------------
   # Zyklen entstehen durch Ladedurchsatz. Wer aufholen soll, braucht ein

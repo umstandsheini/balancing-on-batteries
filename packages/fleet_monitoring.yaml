@@ -12,6 +12,13 @@
 #      sensor.my_battery_daily_charging_in_kwh)
 # Die Banddefinitionen folgen den einstellbaren Fleet-Schwellen, damit
 # die Nachschau immer zur aktuellen Konfiguration passt.
+#
+# Hinweis (Stand 10/2026): In der Referenzinstallation sind die
+# Template-Binaersensoren und die history_stats-Sensoren inzwischen als
+# UI-Helfer angelegt (Einstellungen -> Helfer -> Template bzw.
+# Verlaufsstatistik, gleiche Namen und Einstellungen); dort stehen nur
+# noch die utility_meter in YAML. Beide Wege ergeben dieselben
+# Entitaeten - wer beide anlegt, bekommt Duplikate mit Suffix _2.
 # =====================================================================
 
 template:

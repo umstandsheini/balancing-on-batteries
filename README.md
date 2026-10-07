@@ -191,6 +191,29 @@ gesperrter fehlt genau dann, wenn er gebraucht wird.
 
 ---
 
+## Freilauf: der Notausstieg
+
+Seit 12.08.2026 gibt es das Script **„Fleet Manager: Freilauf"**
+(`script.fleet_manager_freilauf`) als Ein-Klick-Ausstieg fürs Dashboard:
+
+1. schaltet `input_boolean.battery_fleet_manager` aus,
+2. setzt bei allen Speichern Lade- und Entladegrenze (Register 44002/44003) auf
+   2500 W, also keine Sperre,
+3. entfernt die Netzbezugs-Meldung.
+
+Danach regeln die Speicher völlig eigenständig im Anti-Feed-Modus gegen den
+Netzzähler — reines „Netzbezug vermeiden", ohne Zellschonung und
+Zyklenausgleich.
+
+Das Ausschalten des Schalters allein löst über die Automation „Fleet Manager:
+Ausschalten" bereits dieselben Schreibvorgänge aus. Das Script schreibt sie
+trotzdem noch einmal ausdrücklich: War der Schalter schon aus, gibt es keinen
+Wechsel nach `off` mehr, der die Automation auslösen könnte — ein zweiter Klick
+wirkt so trotzdem sicher. Gedacht für alle Fälle, in denen die Kaskade
+offensichtlich falsch steuert oder eine externe Steuerung übernehmen soll.
+
+---
+
 ## Voraussetzungen
 
 - Home Assistant mit `packages`-Konfiguration
@@ -211,8 +234,8 @@ gesperrter fehlt genau dann, wenn er gebraucht wird.
 
 | Datei | Zweck |
 |---|---|
-| `packages/battery_fleet_manager.yaml` | die Steuerung |
-| `packages/fleet_monitoring.yaml` | Kennzahlen zur Wirksamkeitsprüfung |
+| `packages/battery_fleet_manager.yaml` | die Steuerung inkl. Freilauf-Script |
+| `packages/fleet_monitoring.yaml` | Kennzahlen zur Wirksamkeitsprüfung (Template-/Verlaufsteil alternativ als UI-Helfer anlegbar) |
 | `packages/recorder.yaml` | Recorder-Filter (Beispiel) |
 | `docs/register-map.md` | verifizierte Marstek-Modbus-Register |
 | `docs/kaskade.md` | die Prioritätsebenen im Detail |

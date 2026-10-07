@@ -6,7 +6,9 @@ Diese Datei listet alles auf, was angepasst werden muss.
 ## 1. Modbus-Hubs
 
 In `battery_fleet_manager.yaml` erscheinen die Hub-Namen in jedem
-`modbus.write_register`-Aufruf sowie in den Auswahllisten:
+`modbus.write_register`-Aufruf sowie in den Auswahllisten — auch in der
+Automation „Fleet Manager: Ausschalten" und im Freilauf-Script
+(`for_each`-Listen):
 
 | Platzhalter | Bedeutung |
 |---|---|
